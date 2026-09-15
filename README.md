@@ -6,6 +6,26 @@ This repository extends the original from https://github.com/nihofm/volren with 
 
 The scripts to render all images as in the publication reside in the scripts folder. Install and run as per the instructions below. The rendered data is also available from https://osf.io/tuwh5/ 
 
+## Attach CT HU values to trained Gaussians
+
+`scripts/attach_hu_to_ply.py` maps every Gaussian center from physical/world
+coordinates back into the original CT and samples the CT with trilinear
+interpolation. The CT origin, spacing, and direction matrix are respected. A new
+`property float hu` is appended to each vertex in a new binary PLY; the input PLY
+is not modified.
+
+```bash
+python scripts/attach_hu_to_ply.py \
+    --ct path/to/ct.nii.gz \
+    --input-ply path/to/point_cloud.ply \
+    --output-ply path/to/point_cloud_hu.ply
+```
+
+By default the command fails if any Gaussian lies outside the CT volume, since
+that usually indicates a coordinate-system mismatch. Use `--outside clamp` or
+`--outside nan` only when that behavior is intentional. Pass `--overwrite` to
+replace an existing output file; the input and output paths must always differ.
+
 
 <br><br>
 -----
