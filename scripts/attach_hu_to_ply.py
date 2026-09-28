@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Sample CT intensities at Gaussian centers and append them to a PLY file.
+"""Sample multiscale CT intensities at Gaussian centers and append them to PLY.
 
 The Gaussian positions are interpreted as physical/world coordinates.  The CT
 origin, spacing, and direction matrix are therefore all used when converting a
 position to a continuous voxel index.  Intensities are sampled with trilinear
-interpolation and stored as a new ``property float hu`` on every PLY vertex.
+interpolation. Three values are stored on every PLY vertex:
+
+``hu``
+    Raw CT intensity.
+``hu_macro``
+    Low-frequency tissue intensity from a broad Gaussian-smoothed CT.
+``hu_detail``
+    Band-pass detail: a lightly smoothed CT minus a more broadly smoothed CT.
 
 The input PLY is never modified.  This script currently accepts binary PLY
 files whose first data element is ``vertex`` and whose vertex properties are
@@ -59,8 +66,8 @@ class PlyHeader:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Sample a CT volume at every Gaussian center and append a float HU "
-            "property to a binary PLY point cloud."
+            "Sample raw and multiscale CT HU values at every Gaussian center "
+            "and append them to a binary PLY point cloud."
         )
     )
     parser.add_argument("--ct", required=True, type=Path, help="Input CT NIfTI image.")
@@ -84,6 +91,34 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1_000_000,
         help="Number of Gaussian centers sampled per chunk (default: 1000000).",
+    )
+    parser.add_argument(
+        "--macro-sigma-mm",
+        type=float,
+        default=5.0,
+        help="Gaussian sigma for broad HU variation in mm (default: 5.0).",
+    )
+    parser.add_argument(
+        "--detail-fine-sigma-mm",
+        type=float,
+        default=0.8,
+        help="Fine Gaussian sigma for HU detail in mm (default: 0.8).",
+    )
+    parser.add_argument(
+        "--detail-coarse-sigma-mm",
+        type=float,
+        default=2.5,
+        help="Coarse Gaussian sigma subtracted for HU detail in mm (default: 2.5).",
+    )
+    parser.add_argument(
+        "--smoothing-min-hu",
+        type=float,
+        default=-300.0,
+        help=(
+            "Voxels below this HU do not contribute to multiscale smoothing, "
+            "preventing surrounding air from bleeding into surface tissue "
+            "(default: -300)."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -258,10 +293,35 @@ def trilinear_sample(
     return sampled, valid
 
 
+def normalized_gaussian_smooth(
+    image: sitk.Image,
+    tissue_weight: sitk.Image,
+    sigma_mm: float,
+) -> sitk.Image:
+    """Gaussian smoothing normalized by participating tissue weight.
+
+    This keeps air outside the body from pulling a surface sample toward
+    -1000 HU while retaining fat and other low-density tissue.
+    """
+    weighted_values = sitk.SmoothingRecursiveGaussian(
+        image * tissue_weight, sigma_mm
+    )
+    smoothed_weight = sitk.SmoothingRecursiveGaussian(
+        tissue_weight, sigma_mm
+    )
+    return weighted_values / (smoothed_weight + 1e-6)
+
+
 def output_header_bytes(header: PlyHeader) -> bytes:
     lines = list(header.lines)
     newline = b"\r\n" if lines[0].endswith(b"\r\n") else b"\n"
-    lines.insert(header.hu_insert_index, b"property float hu" + newline)
+    properties = (
+        b"property float hu",
+        b"property float hu_macro",
+        b"property float hu_detail",
+    )
+    for offset, declaration in enumerate(properties):
+        lines.insert(header.hu_insert_index + offset, declaration + newline)
     return b"".join(lines)
 
 
@@ -271,10 +331,19 @@ def write_augmented_ply(
     header: PlyHeader,
     vertices: np.ndarray,
     hu: np.ndarray,
+    hu_macro: np.ndarray,
+    hu_detail: np.ndarray,
     chunk_size: int,
 ) -> None:
     hu_dtype = header.byte_order + "f4"
-    output_dtype = np.dtype(header.vertex_dtype.descr + [("hu", hu_dtype)])
+    output_dtype = np.dtype(
+        header.vertex_dtype.descr
+        + [
+            ("hu", hu_dtype),
+            ("hu_macro", hu_dtype),
+            ("hu_detail", hu_dtype),
+        ]
+    )
     input_vertex_bytes = header.vertex_count * header.vertex_dtype.itemsize
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -292,6 +361,8 @@ def write_augmented_ply(
                 for name in header.vertex_dtype.names or ():
                     output_vertices[name] = vertices[name][start:end]
                 output_vertices["hu"] = hu[start:end]
+                output_vertices["hu_macro"] = hu_macro[start:end]
+                output_vertices["hu_detail"] = hu_detail[start:end]
                 output_vertices.tofile(destination)
 
             with input_path.open("rb") as source:
@@ -315,15 +386,25 @@ def format_distribution(values: np.ndarray) -> str:
     )
 
 
-def print_summary(vertices: np.ndarray, hu: np.ndarray, valid: np.ndarray) -> None:
+def print_summary(
+    vertices: np.ndarray,
+    hu: np.ndarray,
+    hu_macro: np.ndarray,
+    hu_detail: np.ndarray,
+    valid: np.ndarray,
+) -> None:
     print(f"CT coverage: {int(valid.sum())}/{len(valid)} ({valid.mean() * 100:.3f}%)")
-    print(f"All layers: {format_distribution(hu)}")
+    print(f"Raw HU, all layers:    {format_distribution(hu)}")
+    print(f"Macro HU, all layers:  {format_distribution(hu_macro)}")
+    print(f"Detail HU, all layers: {format_distribution(hu_detail)}")
     if "layer" not in (vertices.dtype.names or ()):
         return
     layers = vertices["layer"]
     for layer in np.unique(layers):
-        layer_values = hu[layers == layer]
-        print(f"Layer {int(layer):2d}: {format_distribution(layer_values)}")
+        selected = layers == layer
+        print(f"Layer {int(layer):2d} raw:    {format_distribution(hu[selected])}")
+        print(f"Layer {int(layer):2d} macro:  {format_distribution(hu_macro[selected])}")
+        print(f"Layer {int(layer):2d} detail: {format_distribution(hu_detail[selected])}")
 
 
 def validate_paths(args: argparse.Namespace) -> None:
@@ -339,6 +420,15 @@ def validate_paths(args: argparse.Namespace) -> None:
         )
     if args.chunk_size <= 0:
         raise ValueError("--chunk-size must be greater than zero")
+    if args.macro_sigma_mm <= 0:
+        raise ValueError("--macro-sigma-mm must be greater than zero")
+    if args.detail_fine_sigma_mm <= 0 or args.detail_coarse_sigma_mm <= 0:
+        raise ValueError("Detail sigma values must be greater than zero")
+    if args.detail_fine_sigma_mm >= args.detail_coarse_sigma_mm:
+        raise ValueError(
+            "--detail-fine-sigma-mm must be smaller than "
+            "--detail-coarse-sigma-mm"
+        )
 
 
 def main() -> int:
@@ -355,7 +445,37 @@ def main() -> int:
         image = sitk.ReadImage(str(args.ct))
         if image.GetDimension() != 3:
             raise ValueError(f"Expected a 3D CT image, got {image.GetDimension()}D")
+        image = sitk.Cast(image, sitk.sitkFloat32)
         volume = sitk.GetArrayFromImage(image).astype(np.float32, copy=False)
+
+        print(
+            "Building multiscale CT volumes: "
+            f"macro={args.macro_sigma_mm:g} mm, "
+            f"detail={args.detail_fine_sigma_mm:g}-"
+            f"{args.detail_coarse_sigma_mm:g} mm, "
+            f"smoothing minimum={args.smoothing_min_hu:g} HU"
+        )
+        tissue_weight = sitk.Cast(
+            image >= args.smoothing_min_hu, sitk.sitkFloat32
+        )
+        macro_image = normalized_gaussian_smooth(
+            image, tissue_weight, args.macro_sigma_mm
+        )
+        detail_fine_image = normalized_gaussian_smooth(
+            image, tissue_weight, args.detail_fine_sigma_mm
+        )
+        detail_coarse_image = normalized_gaussian_smooth(
+            image, tissue_weight, args.detail_coarse_sigma_mm
+        )
+        macro_volume = sitk.GetArrayFromImage(macro_image).astype(
+            np.float32, copy=False
+        )
+        detail_volume = (
+            sitk.GetArrayFromImage(detail_fine_image).astype(np.float32, copy=False)
+            - sitk.GetArrayFromImage(detail_coarse_image).astype(
+                np.float32, copy=False
+            )
+        )
 
         points = np.column_stack(
             (vertices["x"], vertices["y"], vertices["z"])
@@ -364,7 +484,15 @@ def main() -> int:
         hu, valid = trilinear_sample(
             volume, indices, args.outside, args.chunk_size
         )
-        print_summary(vertices, hu, valid)
+        hu_macro, macro_valid = trilinear_sample(
+            macro_volume, indices, args.outside, args.chunk_size
+        )
+        hu_detail, detail_valid = trilinear_sample(
+            detail_volume, indices, args.outside, args.chunk_size
+        )
+        if not np.array_equal(valid, macro_valid) or not np.array_equal(valid, detail_valid):
+            raise RuntimeError("Multiscale CT sampling produced inconsistent coverage")
+        print_summary(vertices, hu, hu_macro, hu_detail, valid)
 
         print(f"Writing:     {args.output_ply}")
         write_augmented_ply(
@@ -373,9 +501,13 @@ def main() -> int:
             header,
             vertices,
             hu,
+            hu_macro,
+            hu_detail,
             args.chunk_size,
         )
-        print("Done. Added 'property float hu' to every Gaussian vertex.")
+        print(
+            "Done. Added 'hu', 'hu_macro', and 'hu_detail' to every Gaussian vertex."
+        )
         return 0
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)

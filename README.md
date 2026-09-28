@@ -10,9 +10,13 @@ The scripts to render all images as in the publication reside in the scripts fol
 
 `scripts/attach_hu_to_ply.py` maps every Gaussian center from physical/world
 coordinates back into the original CT and samples the CT with trilinear
-interpolation. The CT origin, spacing, and direction matrix are respected. A new
-`property float hu` is appended to each vertex in a new binary PLY; the input PLY
-is not modified.
+interpolation. The CT origin, spacing, and direction matrix are respected. Three
+float properties are appended to every vertex in a new binary PLY; the input PLY
+is not modified:
+
+- `hu`: raw CT intensity.
+- `hu_macro`: CT intensity after 5 mm Gaussian smoothing, used for broad tissue color.
+- `hu_detail`: 0.8 mm smoothed HU minus 2.5 mm smoothed HU, used for local detail.
 
 ```bash
 python scripts/attach_hu_to_ply.py \
@@ -20,6 +24,11 @@ python scripts/attach_hu_to_ply.py \
     --input-ply path/to/point_cloud.ply \
     --output-ply path/to/point_cloud_hu.ply
 ```
+
+The physical smoothing scales can be changed with `--macro-sigma-mm`,
+`--detail-fine-sigma-mm`, and `--detail-coarse-sigma-mm`. Multiscale smoothing
+uses normalized tissue weights and ignores voxels below `--smoothing-min-hu`
+(default -300 HU), so surrounding air does not bleed into the heart surface.
 
 By default the command fails if any Gaussian lies outside the CT volume, since
 that usually indicates a coordinate-system mismatch. Use `--outside clamp` or
