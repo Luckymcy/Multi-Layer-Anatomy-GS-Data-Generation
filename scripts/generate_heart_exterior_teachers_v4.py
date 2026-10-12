@@ -70,8 +70,8 @@ def vtk_image_from_sitk(image):
     return vtk_image
 
 
-def sdf_surface(mask_image, sigma_mm, smooth_iterations=2):
-    sdf = sitk.SignedMaurerDistanceMap(
+def sdf_surface(mask_image, sigma_mm, smooth_iterations=2, sdf_image=None):
+    sdf = sdf_image if sdf_image is not None else sitk.SignedMaurerDistanceMap(
         sitk.Cast(mask_image, sitk.sitkUInt8),
         insideIsPositive=True,
         squaredDistance=False,
@@ -187,11 +187,9 @@ def heart_rgb(hu, points):
 
 def fat_rgb(hu, points):
     intensity = np.clip((hu + 190.0) / 160.0, 0.0, 1.0)
-    dark = np.array([142.0, 76.0, 20.0])
-    light = np.array([225.0, 174.0, 72.0])
+    dark = np.array([174.0, 123.0, 67.0])
+    light = np.array([239.0, 207.0, 141.0])
     rgb = dark[None, :] * (1 - intensity[:, None]) + light[None, :] * intensity[:, None]
-    texture = (np.sin(points[:, 0] * 0.45) * np.sin(points[:, 2] * 0.39))
-    rgb *= (0.93 + 0.07 * texture[:, None])
     return np.clip(rgb, 0, 255).astype(np.uint8)
 
 
@@ -286,6 +284,11 @@ def alpha_bbox(images, padding=14):
 
 def write_comparison(paths, labels, output):
     images = [Image.open(path).convert("RGBA") for path in paths]
+    target_size = (max(image.width for image in images),
+                   max(image.height for image in images))
+    images = [image if image.size == target_size else
+              image.resize(target_size, Image.Resampling.LANCZOS)
+              for image in images]
     box = alpha_bbox(images)
     tile, header = 480, 44
     canvas = Image.new("RGB", (tile * len(images), tile + header), (16, 18, 22))
@@ -320,6 +323,14 @@ def main():
     parser.add_argument("--fat-hu-low", type=float, default=-190.0)
     parser.add_argument("--fat-hu-high", type=float, default=-30.0)
     parser.add_argument("--minimum-fat-component", type=int, default=150)
+    parser.add_argument("--fat-mask", default=None,
+                        help="Optional prefiltered CT-grid fat mask for a preview")
+    parser.add_argument("--fat-sdf-sigma", type=float, default=0.22)
+    parser.add_argument("--fat-mesh-iterations", type=int, default=1)
+    parser.add_argument("--fat-native-sdf", action="store_true",
+                        help="Compute signed distance on native CT grid before isotropic resampling")
+    parser.add_argument("--no-fat-cue", action="store_true",
+                        help="Show only the separate fat mesh, without repainting the heart surface")
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -388,8 +399,28 @@ def main():
             useImageSpacing=True,
         )
     )
-    fat = ((~heart) & (distance > 0) & (distance <= args.fat_shell_mm)
-           & (ct >= args.fat_hu_low) & (ct <= args.fat_hu_high))
+    fat_sdf_iso = None
+    if args.fat_mask:
+        fat_full = sitk.ReadImage(args.fat_mask)
+        fat_crop = crop_roi(fat_full, start, stop)
+        if args.fat_native_sdf:
+            native_sdf = sitk.SignedMaurerDistanceMap(
+                sitk.Cast(fat_crop > 0, sitk.sitkUInt8),
+                insideIsPositive=True, squaredDistance=False,
+                useImageSpacing=True,
+            ) + min(fat_crop.GetSpacing()) * 0.5
+            fat_sdf_iso = sitk.Resample(
+                native_sdf, heart_iso, sitk.Transform(3, sitk.sitkIdentity),
+                sitk.sitkLinear, -12.0, sitk.sitkFloat32,
+            )
+        fat_iso = sitk.Resample(
+            fat_crop, heart_iso, sitk.Transform(3, sitk.sitkIdentity),
+            sitk.sitkNearestNeighbor, 0.0, sitk.sitkUInt8,
+        )
+        fat = sitk.GetArrayFromImage(fat_iso) > 0
+    else:
+        fat = ((~heart) & (distance > 0) & (distance <= args.fat_shell_mm)
+               & (ct >= args.fat_hu_low) & (ct <= args.fat_hu_high))
     components = sitk.ConnectedComponent(sitk.GetImageFromArray(fat.astype(np.uint8)))
     components = sitk.RelabelComponent(
         components, minimumObjectSize=args.minimum_fat_component
@@ -397,12 +428,16 @@ def main():
     fat = sitk.GetArrayFromImage(components) > 0
     fat_image = sitk.GetImageFromArray(fat.astype(np.uint8))
     fat_image.CopyInformation(heart_iso)
-    fat_surface = sdf_surface(fat_image, 0.22, smooth_iterations=1)
+    fat_surface = sdf_surface(
+        fat_image, args.fat_sdf_sigma,
+        smooth_iterations=args.fat_mesh_iterations,
+        sdf_image=fat_sdf_iso,
+    )
     fat_points = vtk_to_numpy(fat_surface.GetPoints().GetData()).astype(np.float64)
     fat_hu = inward_median_hu(fat_surface, ct_iso, ct, fat)
     fat_actor = direct_color_actor(
-        fat_surface, fat_rgb(fat_hu, fat_points), roughness=0.78,
-        specular=0.15, opacity=0.94,
+        fat_surface, fat_rgb(fat_hu, fat_points), roughness=0.66,
+        specular=0.26, opacity=0.96,
     )
     fat_distance_image = sitk.SignedMaurerDistanceMap(
         fat_image, insideIsPositive=False, squaredDistance=False,
@@ -450,17 +485,30 @@ def main():
         args.render_size, args.output_size,
     )
     render_supersampled(
-        fat_path, [fat_cue_actor, fat_actor], pose, center, radius,
+        fat_path,
+        [coronary_painted_actor, fat_actor] if args.no_fat_cue else
+        [fat_cue_actor, fat_actor],
+        pose, center, radius,
+        args.render_size, args.output_size,
+    )
+    fat_only_path = os.path.join(
+        args.output_dir, f"view_{args.view_index:06}_fat_only.png"
+    )
+    render_supersampled(
+        fat_only_path, [fat_actor], pose, center, radius,
         args.render_size, args.output_size,
     )
 
     comparison = None
     if args.original_teacher:
         comparison = os.path.join(args.output_dir, "exterior-teacher-v4-comparison.png")
+        fat_label = ("V4 exterior + prefiltered fat mask (diagnostic)"
+                     if args.fat_mask else
+                     "V4 exterior + 2.5 mm fat candidate (diagnostic)")
         write_comparison(
             [args.original_teacher, coronary_path, fat_path],
             ["Current seven-layer teacher", "V4 exterior + dark-red coronaries",
-             "V4 exterior + 2.5 mm fat candidate (diagnostic)"],
+             fat_label],
             comparison,
         )
 
@@ -478,6 +526,12 @@ def main():
         "coronary_surface_points": int(coronary_surface.GetNumberOfPoints()),
         "fat_surface_points": int(fat_surface.GetNumberOfPoints()),
         "fat_candidate_ml": float(fat.sum() * voxel_ml),
+        "fat_mask_source": args.fat_mask,
+        "fat_sdf_sigma_mm": args.fat_sdf_sigma,
+        "fat_mesh_iterations": args.fat_mesh_iterations,
+        "fat_native_sdf": args.fat_native_sdf,
+        "fat_cue_painted_on_heart": not args.no_fat_cue,
+        "fat_only_preview": fat_only_path,
         "heart_hu_percentiles": np.percentile(
             heart_hu, [1, 5, 25, 50, 75, 95, 99]
         ).round(3).tolist(),
