@@ -44,7 +44,12 @@ def main():
     parser.add_argument('--mesh', required=True)
     parser.add_argument('--source-teachers', required=True)
     parser.add_argument('--output', required=True)
+    parser.add_argument('--name', default='heart_adjacent_fat_preserved')
+    parser.add_argument('--lower-fill-intensity', type=float, default=0.0,
+                        help='Neutral lower fill for fat surfaces; 0 preserves legacy lighting')
     args = parser.parse_args()
+    if args.lower_fill_intensity < 0:
+        parser.error('Lower fill intensity must be nonnegative')
     base, output = Path(args.base), Path(args.output)
     if output.exists():
         raise FileExistsError(output)
@@ -58,12 +63,23 @@ def main():
     reader.SetFileName(args.mesh)
     reader.Update()
     surface = reader.GetOutput()
+    if surface.GetNumberOfPoints() == 0:
+        raise ValueError(f'No surface points found in {args.mesh}')
     color = (0.84, 0.70, 0.47)
     actor = exterior.material_actor(surface, color, 0.58, 0.30)
     renderer = vtk.vtkRenderer()
     renderer.SetBackground(0, 0, 0)
     renderer.SetBackgroundAlpha(0)
     exterior.add_lights(renderer, center, radius)
+    if args.lower_fill_intensity > 0:
+        for direction in ((0, -0.8, -1.5), (-0.7, 0.9, -0.8)):
+            light = vtk.vtkLight()
+            light.SetLightTypeToSceneLight()
+            light.SetPosition(*(center + np.asarray(direction) * radius * 2.2))
+            light.SetFocalPoint(*center)
+            light.SetColor(1, 1, 1)
+            light.SetIntensity(args.lower_fill_intensity)
+            renderer.AddLight(light)
     renderer.AddActor(actor)
     window = vtk.vtkRenderWindow()
     window.SetOffScreenRendering(1)
@@ -125,11 +141,12 @@ def main():
     for name in ('train.txt', 'test.txt'):
         shutil.copyfile(Path(args.source_teachers) / name, output / name)
     info = {
-        'layer': 7, 'name': 'heart_adjacent_fat_preserved', 'mesh': args.mesh,
+        'layer': 7, 'name': args.name, 'mesh': args.mesh,
         'base': args.base, 'views': len(cameras), 'initial_points': len(points),
         'fat_color_rgb_0_1': color, 'visible_fat_pixels_highres_percentiles': np.percentile(visible_counts, [5, 50, 95]).tolist(),
         'composition': 'Frozen L6 premultiplied RGB/alpha + fat mesh; expected inverse-depth occlusion with 0.4 mm transition.',
         'previews': review_paths,
+        'lower_fill_intensity': args.lower_fill_intensity,
     }
     (output / 'manifest.json').write_text(json.dumps(info, indent=2), encoding='utf-8')
     window.Finalize()

@@ -38,7 +38,7 @@ def resample(image, reference, interpolation=sitk.sitkLinear, default=-20):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', default='.',
-                        help='Project root containing output, masks, and NIfTI (default: current directory)')
+                        help='Project root containing output and data/ct (default: current directory)')
     parser.add_argument('--output-dir', required=True)
     parser.add_argument('--sigma-mm', type=float, default=0.6)
     parser.add_argument('--heart-sigma-mm', type=float, default=1.0)
@@ -47,8 +47,8 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     source_path = root / 'output/L7_tissue_types_wsl/review/heart_shell_diagnostic.nii.gz'
     source = sitk.ReadImage(str(source_path))
-    heart = sitk.ReadImage(str(root / 'masks/total_free/heart.nii.gz'))
-    ct = sitk.ReadImage(str(root / 'NIfTI/DSCorAdSeq075B26fBestDiast75_7.nii.gz'))
+    heart = sitk.ReadImage(str(root / 'data/ct/masks/total_free/heart.nii.gz'))
+    ct = sitk.ReadImage(str(root / 'data/ct/nifti/DSCorAdSeq075B26fBestDiast75_7.nii.gz'))
     geometry = lambda i: (i.GetSize(), i.GetSpacing(), i.GetOrigin(), i.GetDirection())
     if geometry(source) != geometry(ct) or geometry(heart) != geometry(ct):
         raise ValueError('CT/mask geometry mismatch')
@@ -154,13 +154,13 @@ def main():
     old_padded = sitk.ConstantPad(source_roi, [1, 1, 1], [1, 1, 1], 0)
     old_surface = legacy.extract_surface(old_padded, sitk.GetArrayFromImage(old_padded) > 0, iterations=12)
     old_actor = exterior.material_actor(old_surface, fat_color, 0.58, 0.30)
-    cor_image = sitk.ReadImage(str(root / 'masks/layers/L6_coronary_arteries.nii.gz'))
+    cor_image = sitk.ReadImage(str(root / 'data/ct/masks/layers/L6_coronary_arteries.nii.gz'))
     cor_roi = exterior.crop_roi(cor_image, lo, hi)
     cor_sdf = resample(signed_distance(cor_roi), probability_iso)
     cor_surface = surfaces.surface_from_sdf(sitk.ConstantPad(
         sitk.SmoothingRecursiveGaussian(cor_sdf, 0.16), [1, 1, 1], [1, 1, 1], -20.0), 12, 0.18)
     cor_actor = exterior.material_actor(cor_surface, (0.30, 0.025, 0.03), 0.50, 0.30)
-    camera_config = json.loads((root / 'teachers_v4/manifest.json').read_text())['camera']
+    camera_config = json.loads((root / 'data/ct/teachers/v4/manifest.json').read_text())['camera']
     center = np.asarray(camera_config['center'])
     radius = camera_config['radius']
     poses = legacy.make_poses(center, radius, 120, 42)
